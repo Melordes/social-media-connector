@@ -1,0 +1,1100 @@
+//! The networks. Each module implements the same set of functions; this
+//! module describes every network for the user interface and dispatches calls
+//! to the right module.
+//!
+//! Provider contract (every module exposes these, see `mastodon.rs`):
+//!
+//! * OAuth networks: `begin(ctx, &OAuthBegin) -> OAuthStart` builds the sign-in
+//!   URL; `finish(ctx, &OAuthBegin, &flow, &params) -> Vec<NewAccount>`
+//!   exchanges the code from the browser redirect.
+//! * Form networks: `connect(ctx, &fields) -> Vec<NewAccount>`.
+//! * `refresh(ctx, &Account, &Credentials) -> Credentials` renews tokens.
+//! * `profile`, `publish`, `stream`, `interact`, `delete` as named.
+//! * `validate(&Account, &OutgoingPost) -> Vec<String>`: network-specific
+//!   problems that would make publishing fail (generic limits are checked
+//!   here, in [`validate`]).
+
+use std::collections::HashMap;
+
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::error::{PResult, ProviderError};
+use crate::http::Http;
+use crate::media::{self, ImageLimits};
+use crate::model::*;
+use crate::oauth::Pkce;
+use crate::text::{self, CountMode};
+
+pub mod bluesky;
+pub mod discord;
+pub mod facebook;
+pub mod linkedin;
+pub mod mastodon;
+pub mod misskey;
+pub mod reddit;
+pub mod telegram;
+pub mod tumblr;
+pub mod x;
+
+/// Shared state for provider calls.
+#[derive(Clone, Default)]
+pub struct Ctx {
+    pub http: Http,
+    /// Base URL overrides, keyed by name (used by tests to point a provider
+    /// at a mock server, e.g. `"x.api" -> "http://127.0.0.1:1234"`).
+    pub overrides: HashMap<String, String>,
+}
+
+impl Ctx {
+    pub fn new(http: Http) -> Self {
+        Ctx { http, overrides: HashMap::new() }
+    }
+
+    /// The base URL for `key`, or `default` when not overridden.
+    pub fn base(&self, key: &str, default: &str) -> String {
+        self.overrides.get(key).cloned().unwrap_or_else(|| default.to_string())
+    }
+
+    pub fn with_override(mut self, key: &str, url: &str) -> Self {
+        self.overrides.insert(key.to_string(), url.trim_end_matches('/').to_string());
+        self
+    }
+}
+
+/// Everything needed to start an OAuth sign-in.
+#[derive(Clone, Debug)]
+pub struct OAuthBegin {
+    pub platform: Platform,
+    /// What the user typed in the connect dialog (for example `server`).
+    pub fields: HashMap<String, String>,
+    pub redirect_uri: String,
+    pub state: String,
+    pub pkce: Pkce,
+    /// The user's developer app for networks that need one (from Settings).
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+}
+
+impl OAuthBegin {
+    pub fn field(&self, key: &str) -> Option<&str> {
+        self.fields.get(key).map(|s| s.trim()).filter(|s| !s.is_empty())
+    }
+
+    pub fn require_client_id(&self) -> PResult<&str> {
+        self.client_id.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+            ProviderError::invalid(format!(
+                "Add your {} developer app in Settings → Developer apps first.",
+                self.platform.name()
+            ))
+        })
+    }
+
+    pub fn require_client_secret(&self) -> PResult<&str> {
+        self.client_secret.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+            ProviderError::invalid(format!(
+                "Your {} developer app needs its client secret. Add it in Settings → Developer apps.",
+                self.platform.name()
+            ))
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OAuthStart {
+    pub auth_url: String,
+    /// Provider data kept until the browser comes back.
+    pub flow: Value,
+}
+
+/// Checks the `state` parameter of a redirect against the one we sent.
+pub fn expect_state(params: &HashMap<String, String>, state: &str) -> PResult<()> {
+    if let Some(err) = crate::oauth::callback_error(params) {
+        return Err(ProviderError::Forbidden(err));
+    }
+    match params.get("state") {
+        Some(s) if s == state => Ok(()),
+        _ => Err(ProviderError::invalid(
+            "The sign-in answer did not match this request. Please try again.",
+        )),
+    }
+}
+
+/// The authorization code from a redirect.
+pub fn expect_code(params: &HashMap<String, String>) -> PResult<&str> {
+    params
+        .get("code")
+        .map(String::as_str)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ProviderError::invalid("The network did not send an authorization code."))
+}
+
+// ------------------------------------------------------------ descriptions
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldInfo {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub placeholder: &'static str,
+    /// "text", "password" or "url".
+    pub kind: &'static str,
+    pub required: bool,
+    pub help: Option<&'static str>,
+    pub default_value: Option<&'static str>,
+}
+
+const fn field(key: &'static str, label: &'static str, placeholder: &'static str, kind: &'static str) -> FieldInfo {
+    FieldInfo { key, label, placeholder, kind, required: true, help: None, default_value: None }
+}
+
+impl FieldInfo {
+    const fn help(mut self, help: &'static str) -> Self {
+        self.help = Some(help);
+        self
+    }
+    const fn optional(mut self) -> Self {
+        self.required = false;
+        self
+    }
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectInfo {
+    /// "oauth" (sign in in the browser) or "form" (paste a token).
+    pub method: &'static str,
+    pub fields: Vec<FieldInfo>,
+    /// Needs the user's own developer app (client id) from Settings.
+    pub needs_app: bool,
+    pub app_fields: Vec<FieldInfo>,
+    /// Host used in the redirect URI ("127.0.0.1" or "localhost").
+    pub redirect_host: &'static str,
+    pub setup_url: Option<&'static str>,
+    pub setup_steps: Vec<&'static str>,
+    pub help: Option<&'static str>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Limits {
+    pub max_chars: u32,
+    pub count_mode: CountMode,
+    /// Lower limit when images are attached (Telegram captions).
+    pub max_chars_with_media: Option<u32>,
+    pub max_images: u32,
+    pub image_max_bytes: u64,
+    pub image_max_dimension: u32,
+    pub image_types: Vec<&'static str>,
+    pub alt_text_max: u32,
+    pub requires_media: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Choice {
+    pub value: &'static str,
+    pub label: &'static str,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Features {
+    pub content_warning: bool,
+    pub visibility: Vec<Choice>,
+    pub sensitive: bool,
+    /// "none", "optional" or "required".
+    pub title: &'static str,
+    pub subreddit: bool,
+    pub link: bool,
+    pub tags: bool,
+    pub silent: bool,
+    pub spoiler: bool,
+    pub language: bool,
+    pub reply: bool,
+    pub like: bool,
+    pub repost: bool,
+    pub delete: bool,
+    pub inbox: bool,
+    pub stats: bool,
+    /// Word used for "like" on this network ("Favourite", "Upvote"...).
+    pub like_label: &'static str,
+    pub repost_label: &'static str,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ParamInfo {
+    pub label: &'static str,
+    pub placeholder: &'static str,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamKindInfo {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub param: Option<ParamInfo>,
+    /// Added automatically when an account is connected.
+    pub default: bool,
+    pub notifications: bool,
+    /// The account's own posts (used for analytics).
+    pub own_posts: bool,
+}
+
+const fn sk(id: &'static str, label: &'static str) -> StreamKindInfo {
+    StreamKindInfo { id, label, param: None, default: false, notifications: false, own_posts: false }
+}
+
+impl StreamKindInfo {
+    const fn default_on(mut self) -> Self {
+        self.default = true;
+        self
+    }
+    const fn notifications(mut self) -> Self {
+        self.notifications = true;
+        self
+    }
+    const fn own(mut self) -> Self {
+        self.own_posts = true;
+        self
+    }
+    const fn param(mut self, label: &'static str, placeholder: &'static str) -> Self {
+        self.param = Some(ParamInfo { label, placeholder });
+        self
+    }
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformInfo {
+    pub id: Platform,
+    pub name: &'static str,
+    pub color: &'static str,
+    pub summary: &'static str,
+    pub connect: ConnectInfo,
+    pub limits: Limits,
+    pub features: Features,
+    pub streams: Vec<StreamKindInfo>,
+    pub notes: Vec<&'static str>,
+}
+
+const VIS_FEDI: [Choice; 3] = [
+    Choice { value: "public", label: "Public" },
+    Choice { value: "unlisted", label: "Quiet public" },
+    Choice { value: "followers", label: "Followers only" },
+];
+
+fn client_id_field() -> FieldInfo {
+    field("clientId", "Client ID", "", "text")
+}
+
+fn client_secret_field() -> FieldInfo {
+    field("clientSecret", "Client secret", "", "password")
+}
+
+pub fn platform_info(p: Platform) -> PlatformInfo {
+    match p {
+        Platform::Mastodon => PlatformInfo {
+            id: p,
+            name: "Mastodon",
+            color: "#6364FF",
+            summary: "Any Mastodon server, and servers that speak its API (GoToSocial, Akkoma, Pleroma, Iceshrimp.NET).",
+            connect: ConnectInfo {
+                method: "oauth",
+                fields: vec![field("server", "Server", "mastodon.social", "text").help("The server your account is on.")],
+                needs_app: false,
+                app_fields: vec![],
+                redirect_host: "127.0.0.1",
+                setup_url: None,
+                setup_steps: vec![],
+                help: Some("You sign in on your server's own page in the browser. No developer setup needed."),
+            },
+            limits: Limits {
+                max_chars: 500,
+                count_mode: CountMode::Mastodon,
+                max_chars_with_media: None,
+                max_images: 4,
+                image_max_bytes: 16 * 1024 * 1024,
+                image_max_dimension: 0,
+                image_types: media::COMMON_TYPES.to_vec(),
+                alt_text_max: 1500,
+                requires_media: false,
+            },
+            features: Features {
+                content_warning: true,
+                visibility: VIS_FEDI.to_vec(),
+                sensitive: true,
+                title: "none",
+                language: true,
+                reply: true,
+                like: true,
+                repost: true,
+                delete: true,
+                inbox: true,
+                stats: true,
+                like_label: "Favourite",
+                repost_label: "Boost",
+                ..Default::default()
+            },
+            streams: vec![
+                sk("home", "Home").default_on(),
+                sk("notifications", "Notifications").default_on().notifications(),
+                sk("mentions", "Mentions").notifications(),
+                sk("me", "My posts").own(),
+                sk("local", "Local timeline"),
+                sk("federated", "Federated timeline"),
+                sk("hashtag", "Hashtag").param("Hashtag", "photography"),
+            ],
+            notes: vec![],
+        },
+        Platform::Bluesky => PlatformInfo {
+            id: p,
+            name: "Bluesky",
+            color: "#1185FE",
+            summary: "Bluesky and other AT Protocol servers.",
+            connect: ConnectInfo {
+                method: "form",
+                fields: vec![
+                    field("identifier", "Handle or email", "you.bsky.social", "text"),
+                    field("password", "App password", "xxxx-xxxx-xxxx-xxxx", "password")
+                        .help("Create one in Bluesky: Settings → Privacy and security → App passwords. Don't use your main password."),
+                    field("server", "Hosting provider", "Found automatically", "text")
+                        .optional()
+                        .help("Only needed for a self-hosted PDS."),
+                ],
+                needs_app: false,
+                app_fields: vec![],
+                redirect_host: "127.0.0.1",
+                setup_url: Some("https://bsky.app/settings/app-passwords"),
+                setup_steps: vec![],
+                help: Some("Uses an app password, which you can revoke at any time in Bluesky's settings."),
+            },
+            limits: Limits {
+                max_chars: 300,
+                count_mode: CountMode::Bluesky,
+                max_chars_with_media: None,
+                max_images: 4,
+                image_max_bytes: 1_000_000,
+                image_max_dimension: 2000,
+                image_types: vec!["image/jpeg", "image/png", "image/webp"],
+                alt_text_max: 2000,
+                requires_media: false,
+            },
+            features: Features {
+                title: "none",
+                language: true,
+                reply: true,
+                like: true,
+                repost: true,
+                delete: true,
+                inbox: true,
+                stats: true,
+                like_label: "Like",
+                repost_label: "Repost",
+                ..Default::default()
+            },
+            streams: vec![
+                sk("home", "Following").default_on(),
+                sk("notifications", "Notifications").default_on().notifications(),
+                sk("mentions", "Mentions and replies").notifications(),
+                sk("me", "My posts").own(),
+                sk("discover", "Discover"),
+                sk("search", "Search").param("Search for", "#photography"),
+            ],
+            notes: vec!["Images larger than 1 MB are scaled down automatically.", "Long links are shortened in the text and stay clickable, like in the Bluesky app."],
+        },
+        Platform::Misskey => PlatformInfo {
+            id: p,
+            name: "Misskey",
+            color: "#86B300",
+            summary: "Misskey and its forks (Sharkey, Firefish, CherryPick).",
+            connect: ConnectInfo {
+                method: "oauth",
+                fields: vec![field("server", "Server", "misskey.io", "text")],
+                needs_app: false,
+                app_fields: vec![],
+                redirect_host: "127.0.0.1",
+                setup_url: None,
+                setup_steps: vec![],
+                help: Some("You approve access on your server's page in the browser. No developer setup needed."),
+            },
+            limits: Limits {
+                max_chars: 3000,
+                count_mode: CountMode::Graphemes,
+                max_chars_with_media: None,
+                max_images: 16,
+                image_max_bytes: 30 * 1024 * 1024,
+                image_max_dimension: 0,
+                image_types: media::COMMON_TYPES.to_vec(),
+                alt_text_max: 512,
+                requires_media: false,
+            },
+            features: Features {
+                content_warning: true,
+                visibility: vec![
+                    Choice { value: "public", label: "Public" },
+                    Choice { value: "unlisted", label: "Home only" },
+                    Choice { value: "followers", label: "Followers only" },
+                ],
+                sensitive: true,
+                title: "none",
+                reply: true,
+                like: true,
+                repost: true,
+                delete: true,
+                inbox: true,
+                stats: true,
+                like_label: "React",
+                repost_label: "Renote",
+                ..Default::default()
+            },
+            streams: vec![
+                sk("home", "Home").default_on(),
+                sk("notifications", "Notifications").default_on().notifications(),
+                sk("mentions", "Mentions").notifications(),
+                sk("me", "My notes").own(),
+                sk("local", "Local timeline"),
+                sk("social", "Social timeline"),
+                sk("global", "Global timeline"),
+            ],
+            notes: vec![],
+        },
+        Platform::X => PlatformInfo {
+            id: p,
+            name: "X",
+            color: "#0F1419",
+            summary: "X (formerly Twitter), through your own X developer app.",
+            connect: ConnectInfo {
+                method: "oauth",
+                fields: vec![],
+                needs_app: true,
+                app_fields: vec![
+                    client_id_field().help("OAuth 2.0 Client ID from the app's \"Keys and tokens\" page."),
+                    client_secret_field()
+                        .optional()
+                        .help("Only for apps of type \"Web App, Automated App or Bot\". Leave empty for a \"Native App\"."),
+                ],
+                redirect_host: "127.0.0.1",
+                setup_url: Some("https://console.x.com"),
+                setup_steps: vec![
+                    "Sign in to the X Developer Console at console.x.com, accept the developer agreement and create an app.",
+                    "Buy API credits there: X charges for every request (pay-per-use), and requests fail without credits.",
+                    "In the app's \"User authentication settings\", enable OAuth 2.0, choose app permissions \"Read and write\" and type \"Native App\".",
+                    "Add the callback URI shown below exactly as written (X wants 127.0.0.1 here, not localhost), and any website URL.",
+                    "Copy the OAuth 2.0 Client ID from \"Keys and tokens\" into the field below.",
+                ],
+                help: Some("You sign in on x.com in the browser."),
+            },
+            limits: Limits {
+                max_chars: 280,
+                count_mode: CountMode::Twitter,
+                max_chars_with_media: None,
+                max_images: 4,
+                image_max_bytes: 5 * 1024 * 1024,
+                image_max_dimension: 0,
+                image_types: media::COMMON_TYPES.to_vec(),
+                alt_text_max: 1000,
+                requires_media: false,
+            },
+            features: Features {
+                title: "none",
+                reply: true,
+                // X removed likes from all self-serve API access in April 2026.
+                like: false,
+                repost: true,
+                delete: true,
+                inbox: false,
+                stats: true,
+                like_label: "Like",
+                repost_label: "Repost",
+                ..Default::default()
+            },
+            streams: vec![
+                sk("home", "Home timeline"),
+                sk("mentions", "Mentions").default_on().notifications(),
+                sk("me", "My posts").default_on().own(),
+            ],
+            notes: vec![
+                "X charges your developer account for every request and every post it returns (pay-per-use credits from console.x.com). Reading the home timeline costs more than reading the app owner's own posts and mentions, and posts with a link cost more to publish.",
+                "X only lets apps reply to posts that mention you or quote you, and to your own posts.",
+                "X does not let self-serve developer apps like posts, so liking is not available for X.",
+            ],
+        },
+        Platform::Facebook => PlatformInfo {
+            id: p,
+            name: "Facebook Pages",
+            color: "#0866FF",
+            summary: "Facebook Pages you manage, through your own Meta developer app.",
+            connect: ConnectInfo {
+                method: "oauth",
+                fields: vec![],
+                needs_app: true,
+                app_fields: vec![
+                    field("clientId", "App ID", "", "text"),
+                    client_secret_field().help("App secret from App settings → Basic."),
+                ],
+                redirect_host: "localhost",
+                setup_url: Some("https://developers.facebook.com/apps/"),
+                setup_steps: vec![
+                    "Create an app at developers.facebook.com/apps with the use case \"Manage everything on your Page\". You don't need to connect a business portfolio.",
+                    "In that use case's permissions, add pages_read_engagement, pages_read_user_content, pages_manage_posts and pages_manage_engagement (pages_show_list and business_management are already there).",
+                    "Under Facebook Login for Business → Settings, add the redirect URI shown below to Valid OAuth Redirect URIs.",
+                    "Leave the app in Development mode (don't publish it): Meta only accepts http://localhost redirects in Development mode, and as the app's admin you can use it with your own Pages without App Review.",
+                    "Copy the App ID and App secret (App settings → Basic) into the fields below.",
+                ],
+                help: Some("Every Page you choose during sign-in is added as its own account. Page sign-ins don't expire, but Facebook ends them if you change your password, remove the app or lose your role on the Page."),
+            },
+            limits: Limits {
+                max_chars: 63206,
+                count_mode: CountMode::Graphemes,
+                max_chars_with_media: None,
+                max_images: 10,
+                image_max_bytes: 10 * 1024 * 1024,
+                image_max_dimension: 0,
+                image_types: media::NO_WEBP.to_vec(),
+                alt_text_max: 0,
+                requires_media: false,
+            },
+            features: Features {
+                title: "none",
+                link: true,
+                reply: true,
+                like: false,
+                repost: false,
+                delete: true,
+                inbox: false,
+                stats: true,
+                like_label: "Like",
+                repost_label: "Share",
+                ..Default::default()
+            },
+            streams: vec![sk("me", "Page posts").default_on().own()],
+            notes: vec![
+                "On posts with images, the link is added to the text instead of a link preview.",
+                "Replies are posted as comments by the Page and can include one image.",
+            ],
+        },
+        Platform::Linkedin => PlatformInfo {
+            id: p,
+            name: "LinkedIn",
+            color: "#0A66C2",
+            summary: "Your LinkedIn profile, through your own LinkedIn developer app.",
+            connect: ConnectInfo {
+                method: "oauth",
+                fields: vec![],
+                needs_app: true,
+                app_fields: vec![client_id_field(), client_secret_field().help("From the app's Auth tab.")],
+                redirect_host: "localhost",
+                setup_url: Some("https://www.linkedin.com/developers/apps"),
+                setup_steps: vec![
+                    "Create an app at linkedin.com/developers (it needs a LinkedIn Page; your own is fine).",
+                    "On the Products tab, add \"Sign In with LinkedIn using OpenID Connect\" and \"Share on LinkedIn\".",
+                    "On the Auth tab, add the redirect URL shown below under \"Authorized redirect URLs for your app\".",
+                    "Copy the Client ID and Primary Client Secret into the fields below.",
+                ],
+                help: Some("You sign in on linkedin.com in the browser. LinkedIn sign-ins last 60 days; reconnect when asked."),
+            },
+            limits: Limits {
+                max_chars: 3000,
+                count_mode: CountMode::Graphemes,
+                max_chars_with_media: None,
+                max_images: 20,
+                image_max_bytes: 10 * 1024 * 1024,
+                // The Images API takes fewer than 36,152,320 pixels; 6012² is just below.
+                image_max_dimension: 6012,
+                image_types: media::NO_WEBP.to_vec(),
+                alt_text_max: 4086,
+                requires_media: false,
+            },
+            features: Features {
+                visibility: vec![
+                    Choice { value: "public", label: "Anyone" },
+                    Choice { value: "connections", label: "Connections only" },
+                ],
+                title: "none",
+                delete: true,
+                stats: false,
+                like_label: "Like",
+                repost_label: "Repost",
+                ..Default::default()
+            },
+            streams: vec![],
+            notes: vec!["LinkedIn does not let apps like this one read feeds, so LinkedIn accounts are for posting."],
+        },
+        Platform::Reddit => PlatformInfo {
+            id: p,
+            name: "Reddit",
+            color: "#FF4500",
+            summary: "Reddit, through your own Reddit app (its API access must be approved by Reddit).",
+            connect: ConnectInfo {
+                method: "oauth",
+                fields: vec![],
+                needs_app: true,
+                app_fields: vec![
+                    client_id_field().help("The string under the app name on reddit.com/prefs/apps."),
+                    client_secret_field()
+                        .optional()
+                        .help("Only for apps of the type \"web app\" or \"script\". Leave empty for an \"installed app\"."),
+                ],
+                redirect_host: "127.0.0.1",
+                setup_url: Some("https://www.reddit.com/prefs/apps"),
+                setup_steps: vec![
+                    "You need your own Reddit app with approved API access (type \"installed app\" is best). Since November 2025 Reddit approves each new app under its Responsible Builder Policy, and it is closing public API access by March 2027.",
+                    "On reddit.com/prefs/apps, edit the app and set its redirect URI to the one shown below.",
+                    "Copy the client ID (the string under the app's name) into the field below, and the secret too if the app has one.",
+                ],
+                help: Some("You sign in on reddit.com in the browser."),
+            },
+            limits: Limits {
+                max_chars: 40000,
+                count_mode: CountMode::Graphemes,
+                max_chars_with_media: None,
+                max_images: 0,
+                image_max_bytes: 20 * 1024 * 1024,
+                image_max_dimension: 0,
+                image_types: vec![],
+                alt_text_max: 0,
+                requires_media: false,
+            },
+            features: Features {
+                sensitive: true,
+                title: "required",
+                subreddit: true,
+                link: true,
+                spoiler: true,
+                reply: true,
+                like: true,
+                repost: false,
+                delete: true,
+                inbox: true,
+                stats: true,
+                like_label: "Upvote",
+                repost_label: "Crosspost",
+                ..Default::default()
+            },
+            streams: vec![
+                sk("home", "Home").default_on(),
+                sk("notifications", "Inbox").default_on().notifications(),
+                sk("me", "My posts").own(),
+                sk("subreddit", "Subreddit").param("Subreddit", "rust"),
+            ],
+            notes: vec![
+                "Posts go to the subreddit you enter (or to your profile with u_yourname). Images are not supported for Reddit.",
+                "Reddit is closing its public API: apps not registered at developers.reddit.com lose access from January 12, 2027, and public API access ends by March 2027.",
+            ],
+        },
+        Platform::Tumblr => PlatformInfo {
+            id: p,
+            name: "Tumblr",
+            color: "#36465D",
+            summary: "Your Tumblr blog, through your own Tumblr app.",
+            connect: ConnectInfo {
+                method: "oauth",
+                fields: vec![],
+                needs_app: true,
+                app_fields: vec![
+                    field("clientId", "OAuth consumer key", "", "text"),
+                    field("clientSecret", "OAuth consumer secret", "", "password"),
+                ],
+                redirect_host: "127.0.0.1",
+                setup_url: Some("https://www.tumblr.com/oauth/apps"),
+                setup_steps: vec![
+                    "Register an application at tumblr.com/oauth/apps (use the redirect URI shown below as the default callback URL).",
+                    "Edit the application and add the same redirect URI under \"OAuth2 redirect URLs\".",
+                    "Copy the OAuth consumer key and secret into the fields below.",
+                ],
+                help: Some("You sign in on tumblr.com in the browser. Posts go to your primary blog."),
+            },
+            limits: Limits {
+                // Tumblr limits each paragraph (4,096 characters) rather than
+                // the post; that is checked in `tumblr::validate`.
+                max_chars: 100_000,
+                count_mode: CountMode::Graphemes,
+                max_chars_with_media: None,
+                max_images: 10,
+                image_max_bytes: 10 * 1024 * 1024,
+                image_max_dimension: 0,
+                image_types: media::NO_WEBP.to_vec(),
+                alt_text_max: 4096,
+                requires_media: false,
+            },
+            features: Features {
+                title: "optional",
+                link: true,
+                tags: true,
+                reply: false,
+                like: true,
+                repost: true,
+                delete: true,
+                inbox: true,
+                stats: true,
+                like_label: "Like",
+                repost_label: "Reblog",
+                ..Default::default()
+            },
+            streams: vec![
+                sk("home", "Dashboard").default_on(),
+                sk("notifications", "Activity").default_on().notifications(),
+                sk("me", "My posts").own(),
+                sk("tagged", "Tag").param("Tag", "art"),
+            ],
+            notes: vec!["Tumblr allows 250 posts (reblogs included) and 250 uploaded images per account per day."],
+        },
+        Platform::Telegram => PlatformInfo {
+            id: p,
+            name: "Telegram",
+            color: "#26A5E4",
+            summary: "Post to a Telegram channel or group through a bot you own.",
+            connect: ConnectInfo {
+                method: "form",
+                fields: vec![
+                    field("botToken", "Bot token", "123456789:AA...", "password")
+                        .help("Create a bot with @BotFather in Telegram and paste the token it gives you."),
+                    field("chat", "Channel or group", "@mychannel", "text")
+                        .help("The @username of a public channel, or the numeric chat ID. Add the bot as an admin that can post messages."),
+                ],
+                needs_app: false,
+                app_fields: vec![],
+                redirect_host: "127.0.0.1",
+                setup_url: Some("https://t.me/BotFather"),
+                setup_steps: vec![],
+                help: Some("Messages are posted by your bot in the channel's name."),
+            },
+            limits: Limits {
+                max_chars: 4096,
+                count_mode: CountMode::Utf16,
+                max_chars_with_media: Some(1024),
+                max_images: 10,
+                image_max_bytes: 10 * 1024 * 1024,
+                image_max_dimension: 0,
+                image_types: vec!["image/jpeg", "image/png", "image/webp"],
+                alt_text_max: 0,
+                requires_media: false,
+            },
+            features: Features {
+                title: "none",
+                silent: true,
+                delete: true,
+                like_label: "Like",
+                repost_label: "Forward",
+                ..Default::default()
+            },
+            streams: vec![],
+            notes: vec!["Bots cannot read a channel's history, so Telegram accounts are for posting."],
+        },
+        Platform::Discord => PlatformInfo {
+            id: p,
+            name: "Discord",
+            color: "#5865F2",
+            summary: "Post to a Discord channel through a webhook.",
+            connect: ConnectInfo {
+                method: "form",
+                fields: vec![
+                    field("webhookUrl", "Webhook URL", "https://discord.com/api/webhooks/...", "password").help(
+                        "In Discord: Server settings → Integrations → Webhooks → New webhook, pick the channel, then \"Copy webhook URL\".",
+                    ),
+                    field("name", "Display name", "Uses the webhook's name", "text").optional(),
+                ],
+                needs_app: false,
+                app_fields: vec![],
+                redirect_host: "127.0.0.1",
+                setup_url: None,
+                setup_steps: vec![],
+                help: Some("Messages appear in the channel under the webhook's name and picture."),
+            },
+            limits: Limits {
+                max_chars: 2000,
+                count_mode: CountMode::Utf16,
+                max_chars_with_media: None,
+                max_images: 10,
+                image_max_bytes: 10 * 1024 * 1024,
+                image_max_dimension: 0,
+                image_types: media::COMMON_TYPES.to_vec(),
+                alt_text_max: 1024,
+                requires_media: false,
+            },
+            features: Features {
+                title: "none",
+                delete: true,
+                like_label: "React",
+                repost_label: "Share",
+                ..Default::default()
+            },
+            streams: vec![],
+            notes: vec!["Webhooks can only post, so Discord accounts are for posting."],
+        },
+    }
+}
+
+pub fn all_platforms() -> Vec<PlatformInfo> {
+    Platform::ALL.into_iter().map(platform_info).collect()
+}
+
+/// The limits that apply to one account: the network's, adjusted by what
+/// the account's server reported (stored in `meta`).
+pub fn account_limits(account: &Account) -> Limits {
+    let mut l = platform_info(account.platform).limits;
+    if let Some(v) = account.meta_u64("maxChars") {
+        l.max_chars = v as u32;
+    }
+    if let Some(v) = account.meta_u64("maxImages") {
+        l.max_images = v as u32;
+    }
+    if let Some(v) = account.meta_u64("imageMaxBytes") {
+        l.image_max_bytes = v;
+    }
+    if let Some(v) = account.meta_u64("altTextMax") {
+        l.alt_text_max = v as u32;
+    }
+    l
+}
+
+pub fn image_limits(limits: &Limits) -> ImageLimits {
+    // `ImageLimits` wants a 'static list; map to the shared constants.
+    let allowed: &'static [&'static str] = match limits.image_types.as_slice() {
+        t if t == media::COMMON_TYPES => media::COMMON_TYPES,
+        t if t == media::NO_WEBP => media::NO_WEBP,
+        t if t == media::JPEG_PNG => media::JPEG_PNG,
+        ["image/jpeg", "image/png", "image/webp"] => &["image/jpeg", "image/png", "image/webp"],
+        _ => media::JPEG_PNG,
+    };
+    ImageLimits { max_bytes: limits.image_max_bytes, max_dimension: limits.image_max_dimension, allowed }
+}
+
+/// Problems that would make publishing `post` to `account` fail.
+pub fn validate(account: &Account, post: &OutgoingPost) -> Vec<String> {
+    let limits = account_limits(account);
+    let info = platform_info(account.platform);
+    let mut problems = Vec::new();
+    let text = post.text.trim();
+    let title_only = info.features.title != "none" && !post.options.title.as_deref().unwrap_or("").trim().is_empty();
+    if text.is_empty()
+        && post.media.is_empty()
+        && post.options.link.as_deref().unwrap_or("").trim().is_empty()
+        && !title_only
+    {
+        problems.push("The post is empty.".to_string());
+    }
+    let max = if post.media.is_empty() {
+        limits.max_chars
+    } else {
+        limits.max_chars_with_media.unwrap_or(limits.max_chars)
+    };
+    let len = text::count(&post.text, limits.count_mode);
+    if len > max as usize {
+        problems.push(if post.media.is_empty() || limits.max_chars_with_media.is_none() {
+            format!("The text is {len} characters; {} allows {max}.", info.name)
+        } else {
+            format!("With images, {} allows {max} characters; the text is {len}.", info.name)
+        });
+    }
+    if post.media.len() > limits.max_images as usize {
+        problems.push(if limits.max_images == 0 {
+            format!("{} posts from this app can't include images.", info.name)
+        } else {
+            format!("{} allows up to {} images per post.", info.name, limits.max_images)
+        });
+    }
+    if limits.requires_media && post.media.is_empty() {
+        problems.push(format!("{} posts need at least one image.", info.name));
+    }
+    if limits.alt_text_max > 0 {
+        for m in &post.media {
+            if text::graphemes(&m.alt) > limits.alt_text_max as usize {
+                problems.push(format!(
+                    "The description of {} is longer than {} allows ({} characters).",
+                    m.file_name, info.name, limits.alt_text_max
+                ));
+            }
+        }
+    }
+    problems.extend(match account.platform {
+        Platform::Mastodon => mastodon::validate(account, post),
+        Platform::Bluesky => bluesky::validate(account, post),
+        Platform::Misskey => misskey::validate(account, post),
+        Platform::X => x::validate(account, post),
+        Platform::Reddit => reddit::validate(account, post),
+        Platform::Linkedin => linkedin::validate(account, post),
+        Platform::Facebook => facebook::validate(account, post),
+        Platform::Tumblr => tumblr::validate(account, post),
+        Platform::Telegram => telegram::validate(account, post),
+        Platform::Discord => discord::validate(account, post),
+    });
+    problems
+}
+
+// --------------------------------------------------------------- dispatch
+
+pub async fn begin_oauth(ctx: &Ctx, begin: &OAuthBegin) -> PResult<OAuthStart> {
+    match begin.platform {
+        Platform::Mastodon => mastodon::begin(ctx, begin).await,
+        Platform::Misskey => misskey::begin(ctx, begin).await,
+        Platform::X => x::begin(ctx, begin).await,
+        Platform::Reddit => reddit::begin(ctx, begin).await,
+        Platform::Linkedin => linkedin::begin(ctx, begin).await,
+        Platform::Facebook => facebook::begin(ctx, begin).await,
+        Platform::Tumblr => tumblr::begin(ctx, begin).await,
+        p => Err(ProviderError::unsupported(format!("{} does not use browser sign-in.", p.name()))),
+    }
+}
+
+pub async fn finish_oauth(
+    ctx: &Ctx,
+    begin: &OAuthBegin,
+    flow: &Value,
+    params: &HashMap<String, String>,
+) -> PResult<Vec<NewAccount>> {
+    match begin.platform {
+        Platform::Mastodon => mastodon::finish(ctx, begin, flow, params).await,
+        Platform::Misskey => misskey::finish(ctx, begin, flow, params).await,
+        Platform::X => x::finish(ctx, begin, flow, params).await,
+        Platform::Reddit => reddit::finish(ctx, begin, flow, params).await,
+        Platform::Linkedin => linkedin::finish(ctx, begin, flow, params).await,
+        Platform::Facebook => facebook::finish(ctx, begin, flow, params).await,
+        Platform::Tumblr => tumblr::finish(ctx, begin, flow, params).await,
+        p => Err(ProviderError::unsupported(format!("{} does not use browser sign-in.", p.name()))),
+    }
+}
+
+pub async fn connect_form(ctx: &Ctx, platform: Platform, fields: &HashMap<String, String>) -> PResult<Vec<NewAccount>> {
+    match platform {
+        Platform::Bluesky => bluesky::connect(ctx, fields).await,
+        Platform::Telegram => telegram::connect(ctx, fields).await,
+        Platform::Discord => discord::connect(ctx, fields).await,
+        p => Err(ProviderError::unsupported(format!("{} uses browser sign-in.", p.name()))),
+    }
+}
+
+/// Whether the provider can renew `creds` without the user.
+pub fn can_refresh(account: &Account, creds: &Credentials) -> bool {
+    match account.platform {
+        Platform::Bluesky => creds.refresh_token.is_some() || creds.extra_str("appPassword").is_some(),
+        Platform::Facebook | Platform::Telegram | Platform::Discord | Platform::Mastodon | Platform::Misskey => false,
+        _ => creds.refresh_token.is_some(),
+    }
+}
+
+pub async fn refresh(ctx: &Ctx, account: &Account, creds: &Credentials) -> PResult<Credentials> {
+    match account.platform {
+        Platform::Bluesky => bluesky::refresh(ctx, account, creds).await,
+        Platform::X => x::refresh(ctx, account, creds).await,
+        Platform::Reddit => reddit::refresh(ctx, account, creds).await,
+        Platform::Linkedin => linkedin::refresh(ctx, account, creds).await,
+        Platform::Tumblr => tumblr::refresh(ctx, account, creds).await,
+        p => Err(ProviderError::Unauthorized(format!(
+            "The {} sign-in is no longer valid. Reconnect the account.",
+            p.name()
+        ))),
+    }
+}
+
+pub async fn profile(ctx: &Ctx, account: &Account, creds: &Credentials) -> PResult<ProfileUpdate> {
+    match account.platform {
+        Platform::Mastodon => mastodon::profile(ctx, account, creds).await,
+        Platform::Bluesky => bluesky::profile(ctx, account, creds).await,
+        Platform::Misskey => misskey::profile(ctx, account, creds).await,
+        Platform::X => x::profile(ctx, account, creds).await,
+        Platform::Reddit => reddit::profile(ctx, account, creds).await,
+        Platform::Linkedin => linkedin::profile(ctx, account, creds).await,
+        Platform::Facebook => facebook::profile(ctx, account, creds).await,
+        Platform::Tumblr => tumblr::profile(ctx, account, creds).await,
+        Platform::Telegram => telegram::profile(ctx, account, creds).await,
+        Platform::Discord => discord::profile(ctx, account, creds).await,
+    }
+}
+
+pub async fn publish(ctx: &Ctx, account: &Account, creds: &Credentials, post: &OutgoingPost) -> PResult<PublishResult> {
+    match account.platform {
+        Platform::Mastodon => mastodon::publish(ctx, account, creds, post).await,
+        Platform::Bluesky => bluesky::publish(ctx, account, creds, post).await,
+        Platform::Misskey => misskey::publish(ctx, account, creds, post).await,
+        Platform::X => x::publish(ctx, account, creds, post).await,
+        Platform::Reddit => reddit::publish(ctx, account, creds, post).await,
+        Platform::Linkedin => linkedin::publish(ctx, account, creds, post).await,
+        Platform::Facebook => facebook::publish(ctx, account, creds, post).await,
+        Platform::Tumblr => tumblr::publish(ctx, account, creds, post).await,
+        Platform::Telegram => telegram::publish(ctx, account, creds, post).await,
+        Platform::Discord => discord::publish(ctx, account, creds, post).await,
+    }
+}
+
+pub async fn stream(
+    ctx: &Ctx,
+    account: &Account,
+    creds: &Credentials,
+    kind: &str,
+    param: Option<&str>,
+    cursor: Option<&str>,
+) -> PResult<FeedPage> {
+    let info = platform_info(account.platform);
+    if !info.streams.iter().any(|s| s.id == kind) {
+        return Err(ProviderError::unsupported(format!("{} has no \"{kind}\" stream.", info.name)));
+    }
+    match account.platform {
+        Platform::Mastodon => mastodon::stream(ctx, account, creds, kind, param, cursor).await,
+        Platform::Bluesky => bluesky::stream(ctx, account, creds, kind, param, cursor).await,
+        Platform::Misskey => misskey::stream(ctx, account, creds, kind, param, cursor).await,
+        Platform::X => x::stream(ctx, account, creds, kind, param, cursor).await,
+        Platform::Reddit => reddit::stream(ctx, account, creds, kind, param, cursor).await,
+        Platform::Facebook => facebook::stream(ctx, account, creds, kind, param, cursor).await,
+        Platform::Tumblr => tumblr::stream(ctx, account, creds, kind, param, cursor).await,
+        p => Err(ProviderError::unsupported(format!("{} has no streams.", p.name()))),
+    }
+}
+
+pub async fn interact(
+    ctx: &Ctx,
+    account: &Account,
+    creds: &Credentials,
+    target: &Value,
+    action: Interaction,
+) -> PResult<Value> {
+    match account.platform {
+        Platform::Mastodon => mastodon::interact(ctx, account, creds, target, action).await,
+        Platform::Bluesky => bluesky::interact(ctx, account, creds, target, action).await,
+        Platform::Misskey => misskey::interact(ctx, account, creds, target, action).await,
+        Platform::X => x::interact(ctx, account, creds, target, action).await,
+        Platform::Reddit => reddit::interact(ctx, account, creds, target, action).await,
+        Platform::Tumblr => tumblr::interact(ctx, account, creds, target, action).await,
+        p => Err(ProviderError::unsupported(format!("This action is not available on {}.", p.name()))),
+    }
+}
+
+pub async fn delete(ctx: &Ctx, account: &Account, creds: &Credentials, remote_id: &str) -> PResult<()> {
+    match account.platform {
+        Platform::Mastodon => mastodon::delete(ctx, account, creds, remote_id).await,
+        Platform::Bluesky => bluesky::delete(ctx, account, creds, remote_id).await,
+        Platform::Misskey => misskey::delete(ctx, account, creds, remote_id).await,
+        Platform::X => x::delete(ctx, account, creds, remote_id).await,
+        Platform::Reddit => reddit::delete(ctx, account, creds, remote_id).await,
+        Platform::Linkedin => linkedin::delete(ctx, account, creds, remote_id).await,
+        Platform::Facebook => facebook::delete(ctx, account, creds, remote_id).await,
+        Platform::Tumblr => tumblr::delete(ctx, account, creds, remote_id).await,
+        Platform::Telegram => telegram::delete(ctx, account, creds, remote_id).await,
+        Platform::Discord => discord::delete(ctx, account, creds, remote_id).await,
+    }
+}
+
+/// Shared helper: the attachments of a post prepared for `account`'s limits.
+pub fn prepare_images(account: &Account, post: &OutgoingPost) -> PResult<Vec<(media::PreparedImage, String)>> {
+    let limits = account_limits(account);
+    let il = image_limits(&limits);
+    post.media
+        .iter()
+        .map(|m| media::prepare(m, &il, account.platform.name()).map(|img| (img, m.alt.clone())))
+        .collect()
+}
+
+/// Shared helper: a string from a JSON value.
+pub fn js(v: &Value, ptr: &str) -> Option<String> {
+    v.pointer(ptr).and_then(|x| match x {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
+}
+
+pub fn ju(v: &Value, ptr: &str) -> Option<u64> {
+    v.pointer(ptr).and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+}
