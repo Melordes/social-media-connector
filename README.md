@@ -5,6 +5,8 @@ place, in the spirit of Hootsuite: connect accounts, follow their timelines and
 notifications side by side, write a post once and publish or schedule it to many
 accounts, and keep an eye on what went out and how it did.
 
+It is free software in the public domain: anyone may use, change and share it (see [License](#license)).
+
 ## What it does
 
 - **Accounts** – connect as many accounts as you like, several per network. Sign-ins
@@ -158,3 +160,18 @@ src-tauri/
 - Bot tokens and webhook URLs are kept out of error messages and logs.
 - Removing an account deletes its stored sign-in; revoke the app's access on the
   network too if you no longer use it.
+
+## License
+
+Social Media Connector is free and unencumbered software, released into the public
+domain under [the Unlicense](LICENSE). Anyone may use, copy, change, sell and share it,
+in source or compiled form, for any purpose, without asking anyone or giving credit. Its
+authors have given up all their rights to it. This covers every version, including the
+releases published before the license file was added.
+
+Contributions are welcome on the same terms: by sending a change, you release it into
+the public domain too, so the project keeps no owner.
+
+The libraries the app is built with (Tauri, React and the packages listed in
+`package-lock.json` and `src-tauri/Cargo.lock`) keep their own open-source licenses, and
+the networks' names and logos belong to their owners.

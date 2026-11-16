@@ -3,6 +3,8 @@ name = "connector-core"
 version = "0.1.1"
 edition = "2024"
 description = "Accounts, providers, storage and scheduling for Social Media Connector"
+license = "Unlicense"
+repository = "https://github.com/Melordes/social-media-connector"
 
 [dependencies]
 reqwest = { version = "0.13", features = ["json", "multipart", "form", "query"] }
