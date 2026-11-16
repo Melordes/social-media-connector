@@ -81,6 +81,11 @@ npm run tauri dev            # development, with hot reload
 npm run tauri build          # release build and Linux packages (deb, rpm, AppImage)
 ```
 
+On NVIDIA's proprietary driver the app turns off WebKitGTK's DMA-BUF renderer by
+itself, because under Wayland it makes the compositor drop the window ("Error 71
+(Protocol error) dispatching to Wayland display"). Set `WEBKIT_DISABLE_DMABUF_RENDERER=0`
+to keep it on.
+
 ### Windows
 
 Install [Rust](https://rustup.rs) (MSVC toolchain, with the "Desktop development with

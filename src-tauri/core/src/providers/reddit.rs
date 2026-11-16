@@ -863,7 +863,7 @@ mod tests {
     use wiremock::matchers::{body_string_contains, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const UA: &str = "desktop:social-media-connector:v0.1.0";
+    const UA: &str = concat!("desktop:social-media-connector:v", env!("CARGO_PKG_VERSION"));
 
     fn account() -> Account {
         Account {

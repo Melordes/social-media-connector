@@ -1,6 +1,6 @@
 [package]
 name = "social-media-connector"
-version = "0.1.0"
+version = "0.1.1"
 description = "Connect and manage several social media accounts in one desktop app"
 authors = ["Social Media Connector"]
 edition = "2024"
