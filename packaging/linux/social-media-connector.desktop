@@ -1,7 +1,9 @@
 [Desktop Entry]
 Type=Application
 Name=Social Media Connector
+GenericName=Social media manager
 Comment=Manage several social media accounts in one place
+Keywords=social;media;Mastodon;Bluesky;Misskey;X;Twitter;Facebook;LinkedIn;Reddit;Tumblr;Telegram;Discord;scheduler;posts;
 Exec=social-media-connector
 Icon=social-media-connector
 Terminal=false
