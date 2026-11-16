@@ -3,6 +3,7 @@
 
 import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, errorMessage } from "./api";
 import type { Account, AppInfo, FeedItem, Platform, PlatformInfo, Post, ReplyRef, Settings, Stream } from "./types";
 
@@ -172,4 +173,17 @@ export function applyTheme(theme: Settings["theme"]) {
   }
   mediaQuery.onchange = resolve;
   resolve();
+  // Let the native window frame (the title bar on Windows, GTK decorations
+  // on Linux) follow the app's theme; null follows the system again.
+  getCurrentWindow()
+    .setTheme(theme === "system" ? null : theme)
+    .catch(() => undefined);
 }
+
+/** "windows", "linux" or "mac", from the webview's user agent. */
+export const platformOs: "windows" | "linux" | "mac" = /Windows/i.test(navigator.userAgent)
+  ? "windows"
+  : /Mac OS X|Macintosh/i.test(navigator.userAgent)
+    ? "mac"
+    : "linux";
+document.documentElement.classList.add(`os-${platformOs}`);

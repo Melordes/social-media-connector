@@ -40,7 +40,6 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "rpm", "appimage"],
     "category": "SocialNetworking",
     "shortDescription": "Manage several social media accounts in one place",
     "longDescription": "Connect Mastodon, Bluesky, Misskey, X, Facebook Pages, LinkedIn, Reddit, Tumblr, Telegram and Discord accounts; read their streams, and write, schedule and track posts from one window.",
@@ -50,6 +49,8 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "publisher": "Social Media Connector",
+    "copyright": "Social Media Connector contributors"
   }
 }

@@ -164,7 +164,7 @@ export function AccountsPage() {
           <p className="small muted" style={{ marginTop: 24, display: "flex", gap: 8, alignItems: "center" }}>
             <Lock size={14} />
             {info.secretBackend === "keyring"
-              ? "Sign-in tokens are kept in your system keyring."
+              ? `Sign-in tokens are kept in ${info.secretStoreName}.`
               : "No system keyring was found, so sign-in tokens are kept in a file only your user can read, in the app's data folder."}
           </p>
         )}

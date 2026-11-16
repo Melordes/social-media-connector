@@ -10,6 +10,17 @@ use crate::error::{AppError, AppResult};
 
 pub const KEYRING_SERVICE: &str = "com.socialmediaconnector.desktop";
 
+/// What the operating system calls its credential store.
+pub fn system_store_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows Credential Manager"
+    } else if cfg!(target_os = "macos") {
+        "the macOS Keychain"
+    } else {
+        "your system keyring (Secret Service)"
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     Keyring,

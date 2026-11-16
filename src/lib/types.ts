@@ -106,6 +106,8 @@ export interface AppInfo {
   version: string;
   dataDir: string;
   secretBackend: "keyring" | "file";
+  /** Name of the OS credential store ("Windows Credential Manager"...). */
+  secretStoreName: string;
   platforms: PlatformInfo[];
   appCredentials: AppCredentialInfo[];
   redirectUris: Record<Platform, string>;

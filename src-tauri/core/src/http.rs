@@ -277,6 +277,14 @@ pub fn normalize_server(input: &str) -> PResult<String> {
     let host = url
         .host_str()
         .ok_or_else(|| ProviderError::invalid(format!("\"{input}\" is not a valid server address.")))?;
+    // URL parsing accepts hosts like "http;" that no server can have.
+    let ipv6 = host.starts_with('[') && host.ends_with(']');
+    let valid_name = !host.is_empty()
+        && host.split('.').all(|l| !l.is_empty())
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    if !(ipv6 || valid_name) {
+        return Err(ProviderError::invalid(format!("\"{input}\" is not a valid server address.")));
+    }
     match url.scheme() {
         "https" => {}
         "http" if is_loopback_host(host) => {}
@@ -330,6 +338,11 @@ mod tests {
         assert!(normalize_server("http://example.com").is_err());
         assert!(normalize_server("").is_err());
         assert!(normalize_server("ftp://x.org").is_err());
+        assert!(normalize_server("http;//127.0.0.1;39001").is_err());
+        assert!(normalize_server("mastodon..social").is_err());
+        assert_eq!(normalize_server("http://[::1]:8080").unwrap(), "http://[::1]:8080");
+        // Internationalised names arrive as punycode from the URL parser.
+        assert_eq!(normalize_server("bücher.example").unwrap(), "https://xn--bcher-kva.example");
     }
 
     #[test]

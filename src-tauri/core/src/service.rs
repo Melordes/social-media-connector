@@ -92,6 +92,8 @@ pub struct AppInfo {
     pub version: String,
     pub data_dir: String,
     pub secret_backend: String,
+    /// The operating system's credential store, for display.
+    pub secret_store_name: String,
     pub platforms: Vec<PlatformInfo>,
     pub app_credentials: Vec<AppCredentialInfo>,
     /// Redirect URI to register with each network's developer app.
@@ -375,6 +377,7 @@ impl Service {
             version: env!("CARGO_PKG_VERSION").to_string(),
             data_dir: self.data_dir.to_string_lossy().to_string(),
             secret_backend: self.secrets.backend().as_str().to_string(),
+            secret_store_name: crate::secrets::system_store_name().to_string(),
             platforms: providers::all_platforms(),
             app_credentials: self.store.list_app_credentials()?,
             redirect_uris: Platform::ALL.into_iter().map(|p| (p, self.redirect_uri(p))).collect(),

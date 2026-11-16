@@ -1,0 +1,95 @@
+name: Test and release
+
+# Tags decide what gets built:
+#   v1.2.3-windows  -> Windows installers (NSIS .exe and .msi) and a portable .exe
+#   v1.2.3-linux    -> Linux packages (.deb, .rpm, .AppImage)
+#   v1.2.3          -> both
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Core tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Run tests
+        working-directory: src-tauri/core
+        shell: bash
+        run: |
+          # On Windows, also exercise the real Credential Manager.
+          if [ "$RUNNER_OS" = "Windows" ]; then export SMC_TEST_KEYRING=1; fi
+          cargo test
+
+  release-windows:
+    name: Windows release
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') && !endsWith(github.ref_name, '-linux')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Social Media Connector ${{ github.ref_name }}
+          releaseDraft: false
+          prerelease: false
+          # social-media-connector_0.1.0_windows_x64-setup.exe, ..._x64.msi, ..._x64.exe (portable)
+          releaseAssetNamePattern: "[mainBinaryName]_[version]_[platform]_[arch][setup][ext]"
+          uploadPlainBinary: true
+
+  release-linux:
+    name: Linux release
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') && !endsWith(github.ref_name, '-windows')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Social Media Connector ${{ github.ref_name }}
+          releaseDraft: false
+          prerelease: false
+          releaseAssetNamePattern: "[mainBinaryName]_[version]_[platform]_[arch][ext]"

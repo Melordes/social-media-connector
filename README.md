@@ -1,6 +1,6 @@
 # Social Media Connector
 
-A desktop app (Tauri 2 + React) for managing several social media accounts in one
+A desktop app for Linux and Windows (Tauri 2 + React) for managing several social media accounts in one
 place, in the spirit of Hootsuite: connect accounts, follow their timelines and
 notifications side by side, write a post once and publish or schedule it to many
 accounts, and keep an eye on what went out and how it did.
@@ -8,8 +8,9 @@ accounts, and keep an eye on what went out and how it did.
 ## What it does
 
 - **Accounts** – connect as many accounts as you like, several per network. Sign-ins
-  are stored in the system keyring (Secret Service: KWallet or GNOME Keyring), or, if
-  there is none, in a file only your user can read.
+  are stored in the system's credential store (Windows Credential Manager, or the Secret
+  Service on Linux: KWallet, GNOME Keyring), or, if there is none, in a file only your
+  user can read.
 - **Streams** – columns of timelines, notifications, mentions, hashtags, searches,
   subreddits… with like, repost, reply and delete, auto-refresh and paging.
 - **Composer** – pick accounts, write once or customize the text per account, attach
@@ -55,7 +56,20 @@ Instagram is not included: Meta's Instagram publishing API only takes images fro
 public web address (it downloads them from your server), which a desktop app without its
 own server cannot provide.
 
+## Download
+
+Ready-made builds are on the [Releases page](https://github.com/Melordes/social-media-connector/releases):
+
+- **Linux** (`v…-linux` releases): `.deb` (Debian, Ubuntu), `.rpm` (Fedora, openSUSE) and
+  `.AppImage` (any distribution).
+- **Windows 10 and 11** (`v…-windows` releases): the `…-setup.exe` installer (installs for
+  your user, no admin rights needed), an `.msi` for managed installs, and a portable `.exe`.
+  The app uses Microsoft Edge WebView2, which Windows 10 and 11 already include; the
+  installer fetches it if it is missing.
+
 ## Running and building
+
+### Linux
 
 Requirements (Arch/CachyOS package names): `webkit2gtk-4.1`, `libsoup3`,
 `libayatana-appindicator`, `librsvg`, `openssl`, `base-devel`, plus Rust (stable) and
@@ -67,9 +81,42 @@ npm run tauri dev            # development, with hot reload
 npm run tauri build          # release build and Linux packages (deb, rpm, AppImage)
 ```
 
-The data (database, imported images, and the secrets file if no keyring is available)
-lives in `~/.local/share/com.socialmediaconnector.desktop/`. Set `SMC_DATA_DIR` to use
-another folder, and `SMC_SECRET_BACKEND=file` to skip the system keyring.
+### Windows
+
+Install [Rust](https://rustup.rs) (MSVC toolchain, with the "Desktop development with
+C++" workload of the Visual Studio Build Tools) and Node.js 20+, then:
+
+```powershell
+npm install
+npm run tauri dev            # development
+npm run tauri build          # installers: NSIS (.exe) and WiX (.msi)
+```
+
+You can also build the Windows program on Linux with
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin) (the installers themselves are
+made on Windows; the release workflow does that on GitHub):
+
+```sh
+npm run build
+cd src-tauri && cargo xwin build --release --target x86_64-pc-windows-msvc
+```
+
+### Where the data lives
+
+| | Linux | Windows |
+|---|---|---|
+| Database and images | `~/.local/share/com.socialmediaconnector.desktop/` | `%APPDATA%\com.socialmediaconnector.desktop\` |
+| Sign-ins | Secret Service (KWallet, GNOME Keyring) | Windows Credential Manager |
+
+Set `SMC_DATA_DIR` to use another folder, and `SMC_SECRET_BACKEND=file` to keep sign-ins
+in a protected file instead of the system store.
+
+### Releases
+
+Pushing a tag builds and publishes a release through GitHub Actions
+(`.github/workflows/release.yml`): `v1.2.3-windows` builds the Windows installers,
+`v1.2.3-linux` the Linux packages, and `v1.2.3` both. Every push also runs the core
+tests on Linux and on Windows (including the real Windows Credential Manager).
 
 ### Tests
 

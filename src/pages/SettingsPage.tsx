@@ -172,7 +172,11 @@ export function SettingsPage() {
             </Setting>
             <Setting
               title="Where sign-ins are stored"
-              desc={info.secretBackend === "keyring" ? "System keyring (Secret Service)" : "A file in the data folder that only your user can read"}
+              desc={
+                info.secretBackend === "keyring"
+                  ? info.secretStoreName.charAt(0).toUpperCase() + info.secretStoreName.slice(1)
+                  : "A file in the data folder that only your user can read"
+              }
             >
               <span />
             </Setting>
