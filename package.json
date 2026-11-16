@@ -1,7 +1,7 @@
 {
   "name": "social-media-connector",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "Unlicense",
   "repository": {
     "type": "git",
@@ -9,11 +9,12 @@
   },
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "dev": "node scripts/third-party-notices.mjs && vite",
+    "build": "node scripts/third-party-notices.mjs && tsc && vite build",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "notices": "node scripts/third-party-notices.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

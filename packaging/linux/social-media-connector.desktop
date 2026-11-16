@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Social Media Connector
+Comment=Manage several social media accounts in one place
+Exec=social-media-connector
+Icon=social-media-connector
+Terminal=false
+Categories=Network;
+StartupWMClass=social-media-connector

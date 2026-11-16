@@ -62,8 +62,9 @@ own server cannot provide.
 
 Ready-made builds are on the [Releases page](https://github.com/Melordes/social-media-connector/releases):
 
-- **Linux** (`v…-linux` releases): `.deb` (Debian, Ubuntu), `.rpm` (Fedora, openSUSE) and
-  `.AppImage` (any distribution).
+- **Linux** (`v…-linux` releases): `.deb` (Debian, Ubuntu), `.rpm` (Fedora, openSUSE) and a
+  portable `.tar.gz` for any distribution with WebKitGTK 4.1, such as Arch and CachyOS (see
+  the `README.txt` inside).
 - **Windows 10 and 11** (`v…-windows` releases): the `…-setup.exe` installer (installs for
   your user, no admin rights needed), an `.msi` for managed installs, and a portable `.exe`.
   The app uses Microsoft Edge WebView2, which Windows 10 and 11 already include; the
@@ -80,7 +81,7 @@ Node.js 20+.
 ```sh
 npm install
 npm run tauri dev            # development, with hot reload
-npm run tauri build          # release build and Linux packages (deb, rpm, AppImage)
+npm run tauri build          # release build and Linux packages (deb, rpm)
 ```
 
 On NVIDIA's proprietary driver the app turns off WebKitGTK's DMA-BUF renderer by
@@ -122,8 +123,10 @@ in a protected file instead of the system store.
 
 Pushing a tag builds and publishes a release through GitHub Actions
 (`.github/workflows/release.yml`): `v1.2.3-windows` builds the Windows installers,
-`v1.2.3-linux` the Linux packages, and `v1.2.3` both. Every push also runs the core
-tests on Linux and on Windows (including the real Windows Credential Manager).
+`v1.2.3-linux` the Linux packages and the portable archive, and `v1.2.3` both; each
+release also gets the `THIRD-PARTY-NOTICES.txt` of its build. Every push also runs the
+core tests on Linux and on Windows (including the real Windows Credential Manager) and
+checks that every component's license text is found.
 
 ### Tests
 
@@ -150,6 +153,11 @@ src-tauri/
     src/oauth.rs         PKCE and the loopback redirect server
     src/media.rs         image import, resizing, metadata stripping
     src/text.rs          per-network character counting, link and mention detection
+scripts/
+  third-party-notices.mjs  builds the license notices of every bundled component
+packaging/
+  linux/                 desktop entry and README of the portable Linux archive
+  notices/               license texts for components that ship without one
 ```
 
 ## Privacy and security notes
@@ -172,6 +180,9 @@ releases published before the license file was added.
 Contributions are welcome on the same terms: by sending a change, you release it into
 the public domain too, so the project keeps no owner.
 
-The libraries the app is built with (Tauri, React and the packages listed in
-`package-lock.json` and `src-tauri/Cargo.lock`) keep their own open-source licenses, and
-the networks' names and logos belong to their owners.
+The libraries the app is built with (Tauri, React and a few hundred Rust crates) keep
+their own open-source licenses, and the networks' names and logos belong to their owners.
+Their copyright notices and license texts ship with the app (Settings → About →
+Open-source licenses) and with every release (`THIRD-PARTY-NOTICES.txt`). They are
+generated before each build by `scripts/third-party-notices.mjs` (`npm run notices`),
+from the exact components compiled into the Linux and Windows programs.

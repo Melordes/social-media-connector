@@ -53,6 +53,32 @@ fn data_dir(app: &AppHandle) -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("social-media-connector"))
 }
 
+/// On Linux the tray icon needs libayatana-appindicator (or the older
+/// libappindicator), which the tray library loads at run time and panics
+/// without (and release builds abort on panic). Check for it first, so the
+/// app runs without a tray icon instead of crashing. These are the names the
+/// tray library tries, with its "backcompat" feature on.
+#[cfg(target_os = "linux")]
+fn tray_library_available() -> bool {
+    const NAMES: [&str; 4] = [
+        "libayatana-appindicator3.so.1",
+        "libappindicator3.so.1",
+        "libayatana-appindicator3.so",
+        "libappindicator3.so",
+    ];
+    NAMES.iter().any(|name| {
+        let name = std::ffi::CString::new(*name).expect("library names have no NUL");
+        // SAFETY: a valid C string; the handle stays open on purpose, as the
+        // tray library opens the same library right after.
+        !unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_LAZY) }.is_null()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tray_library_available() -> bool {
+    true
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Social Media Connector", true, None::<&str>)?;
     let compose = MenuItem::with_id(app, "compose", "New post…", true, None::<&str>)?;
@@ -121,11 +147,21 @@ pub fn run() {
             tauri::async_runtime::spawn(service.clone().run_scheduler());
             app.manage(service);
 
-            match build_tray(&handle) {
-                Ok(()) => app.state::<TrayState>().0.store(true, Ordering::SeqCst),
-                Err(e) => log::warn!("no tray icon: {e}"),
-            }
-            if !start_hidden {
+            let tray = if !tray_library_available() {
+                log::warn!("no tray icon: libayatana-appindicator is not installed");
+                false
+            } else {
+                match build_tray(&handle) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("no tray icon: {e}");
+                        false
+                    }
+                }
+            };
+            app.state::<TrayState>().0.store(tray, Ordering::SeqCst);
+            // Starting hidden (at login) needs a tray icon to bring the window back.
+            if !start_hidden || !tray {
                 show_main_window(&handle);
             }
             Ok(())

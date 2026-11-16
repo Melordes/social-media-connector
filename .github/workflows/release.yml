@@ -2,8 +2,10 @@ name: Test and release
 
 # Tags decide what gets built:
 #   v1.2.3-windows  -> Windows installers (NSIS .exe and .msi) and a portable .exe
-#   v1.2.3-linux    -> Linux packages (.deb, .rpm, .AppImage)
+#   v1.2.3-linux    -> Linux packages (.deb, .rpm) and a portable .tar.gz
 #   v1.2.3          -> both
+# Every release also gets THIRD-PARTY-NOTICES.txt, the license notices of the
+# components compiled into it (scripts/third-party-notices.mjs).
 on:
   push:
     branches: [main]
@@ -36,9 +38,23 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then export SMC_TEST_KEYRING=1; fi
           cargo test
 
+  notices:
+    name: License notices
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      # Fails when a component's license text can't be found.
+      - run: npm run notices
+
   release-windows:
     name: Windows release
-    needs: test
+    needs: [test, notices]
     if: startsWith(github.ref, 'refs/tags/v') && !endsWith(github.ref_name, '-linux')
     runs-on: windows-latest
     steps:
@@ -63,10 +79,19 @@ jobs:
           # social-media-connector_0.1.0_windows_x64-setup.exe, ..._x64.msi, ..._x64.exe (portable)
           releaseAssetNamePattern: "[mainBinaryName]_[version]_[platform]_[arch][setup][ext]"
           uploadPlainBinary: true
+      # For tags that build both platforms, the Linux job attaches the notices.
+      - name: Attach the license notices
+        if: endsWith(github.ref_name, '-windows')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp src/generated/THIRD-PARTY-NOTICES.txt .
+          gh release upload "$GITHUB_REF_NAME" THIRD-PARTY-NOTICES.txt --clobber
 
   release-linux:
     name: Linux release
-    needs: test
+    needs: [test, notices]
     if: startsWith(github.ref, 'refs/tags/v') && !endsWith(github.ref_name, '-windows')
     runs-on: ubuntu-22.04
     steps:
@@ -74,7 +99,7 @@ jobs:
       - name: System libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev rpm
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -93,3 +118,20 @@ jobs:
           releaseDraft: false
           prerelease: false
           releaseAssetNamePattern: "[mainBinaryName]_[version]_[platform]_[arch][ext]"
+      # The program on its own, for distributions without .deb or .rpm: it uses
+      # the system's WebKitGTK, so it carries no copies of system libraries.
+      - name: Portable archive and license notices
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          name="social-media-connector_${version}_linux_x86_64"
+          mkdir -p "portable/$name"
+          install -m755 src-tauri/target/release/social-media-connector "portable/$name/"
+          install -m644 src-tauri/icons/128x128@2x.png "portable/$name/social-media-connector.png"
+          install -m644 packaging/linux/social-media-connector.desktop packaging/linux/README.txt \
+            LICENSE src/generated/THIRD-PARTY-NOTICES.txt "portable/$name/"
+          tar -C portable -czf "$name.tar.gz" "$name"
+          cp src/generated/THIRD-PARTY-NOTICES.txt .
+          gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" THIRD-PARTY-NOTICES.txt --clobber

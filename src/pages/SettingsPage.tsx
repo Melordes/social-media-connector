@@ -1,12 +1,13 @@
-// Settings: behaviour, developer apps for networks that need them, and
-// advanced options.
+// Settings: behaviour, developer apps for networks that need them, advanced
+// options, and the About section (license, source code, open-source notices).
 
 import { useEffect, useState } from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, ExternalLink, ScrollText } from "lucide-react";
 import type { Settings } from "../lib/types";
 import { api, errorMessage } from "../lib/api";
 import { useApp } from "../lib/store";
-import { PlatformIcon, Switch } from "../components/common";
+import { loadNotices, REPOSITORY_URL } from "../lib/about";
+import { Modal, PlatformIcon, Spinner, Switch } from "../components/common";
 import { DevAppForm } from "../components/ConnectDialog";
 
 function Setting({ title, desc, children }: { title: string; desc?: string; children: React.ReactNode }) {
@@ -30,6 +31,7 @@ export function SettingsPage() {
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [tray, setTray] = useState(true);
   const [port, setPort] = useState(String(settings?.oauthPort ?? 38917));
+  const [showNotices, setShowNotices] = useState(false);
 
   useEffect(() => {
     api.getAutostart().then(setAutostart).catch(() => setAutostart(null));
@@ -180,14 +182,56 @@ export function SettingsPage() {
             >
               <span />
             </Setting>
-            <Setting title="Version" desc={`Social Media Connector ${info.version}`}>
+            <Setting title="Quit" desc="Closes the app completely, tray icon included. Scheduled posts wait until it runs again.">
               <button className="btn" onClick={() => void api.quit()}>
                 Quit app
               </button>
             </Setting>
           </section>
+
+          <section className="card card-pad">
+            <h2 className="section-title">About</h2>
+            <Setting
+              title={`Social Media Connector ${info.version}`}
+              desc="Free and unencumbered software in the public domain (The Unlicense): anyone may use, change and share it."
+            >
+              <button className="btn" onClick={() => void api.openUrl(REPOSITORY_URL)}>
+                <ExternalLink size={15} /> Source code
+              </button>
+            </Setting>
+            <Setting title="Open-source licenses" desc="The notices and license texts of the libraries the app is built with.">
+              <button className="btn" onClick={() => setShowNotices(true)}>
+                <ScrollText size={15} /> View licenses
+              </button>
+            </Setting>
+          </section>
         </div>
       </div>
+      {showNotices && <NoticesDialog onClose={() => setShowNotices(false)} />}
     </>
+  );
+}
+
+/** The third-party notices, generated at build time and loaded on demand. */
+function NoticesDialog({ onClose }: { onClose: () => void }) {
+  const [text, setText] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    loadNotices()
+      .then(setText)
+      .catch(() => setFailed(true));
+  }, []);
+  return (
+    <Modal title="Open-source licenses" onClose={onClose} size="wide">
+      <div className="modal-body">
+        {failed ? (
+          <p className="error-text">The license notices could not be loaded.</p>
+        ) : text === null ? (
+          <Spinner />
+        ) : (
+          <pre className="notices">{text}</pre>
+        )}
+      </div>
+    </Modal>
   );
 }

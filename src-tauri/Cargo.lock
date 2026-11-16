@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "connector-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -4428,10 +4428,11 @@ dependencies = [
 
 [[package]]
 name = "social-media-connector"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "connector-core",
  "env_logger",
+ "libc",
  "log",
  "serde",
  "serde_json",
